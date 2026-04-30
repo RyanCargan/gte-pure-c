@@ -11,6 +11,7 @@
 #include <string.h>
 #include <math.h>
 #include <ctype.h>
+#include <stdint.h>
 
 #ifdef USE_BLAS
 #ifdef __APPLE__
@@ -24,7 +25,7 @@
  * Constants
  * ======================================================================== */
 
-#define GTE_MAGIC "GTE1"
+#define GTE_MAGIC "GTE4"
 #define GTE_LAYER_NORM_EPS 1e-12f
 
 /* Special token IDs */
@@ -37,9 +38,18 @@
 /* Hash table size for vocabulary (prime number > vocab_size) */
 #define VOCAB_HASH_SIZE 40009
 
+/* Quantization var */
+#define QK4_0 32
+
 /* ========================================================================
  * Data Structures
  * ======================================================================== */
+
+/* Quantization struct */
+typedef struct {
+    float scale;        /* Quantization scale for this block */
+    uint8_t qs[16];     /* 32 4-bit weights (2 weights per byte) */
+} block_q4_0;
 
 /* Hash table entry for vocabulary lookup */
 typedef struct {
@@ -50,24 +60,24 @@ typedef struct {
 /* Single transformer layer weights */
 typedef struct {
     /* Self-attention */
-    float *query_weight;      /* [hidden_size, hidden_size] */
-    float *query_bias;        /* [hidden_size] */
-    float *key_weight;        /* [hidden_size, hidden_size] */
-    float *key_bias;          /* [hidden_size] */
-    float *value_weight;      /* [hidden_size, hidden_size] */
-    float *value_bias;        /* [hidden_size] */
-    float *attn_output_weight; /* [hidden_size, hidden_size] */
-    float *attn_output_bias;  /* [hidden_size] */
-    float *attn_ln_weight;    /* [hidden_size] */
-    float *attn_ln_bias;      /* [hidden_size] */
+    block_q4_0 *query_weight;      /* Quantized */
+    float *query_bias;             /* Float32 */
+    block_q4_0 *key_weight;
+    float *key_bias;
+    block_q4_0 *value_weight;
+    float *value_bias;
+    block_q4_0 *attn_output_weight;
+    float *attn_output_bias;
+    float *attn_ln_weight;         /* Float32 */
+    float *attn_ln_bias;           /* Float32 */
 
-    /* Feed-forward network */
-    float *ffn_inter_weight;  /* [intermediate_size, hidden_size] */
-    float *ffn_inter_bias;    /* [intermediate_size] */
-    float *ffn_output_weight; /* [hidden_size, intermediate_size] */
-    float *ffn_output_bias;   /* [hidden_size] */
-    float *ffn_ln_weight;     /* [hidden_size] */
-    float *ffn_ln_bias;       /* [hidden_size] */
+    /* FFN */
+    block_q4_0 *ffn_inter_weight;
+    float *ffn_inter_bias;
+    block_q4_0 *ffn_output_weight;
+    float *ffn_output_bias;
+    float *ffn_ln_weight;
+    float *ffn_ln_bias;
 } layer_weights;
 
 /* Main model context */
@@ -96,8 +106,8 @@ struct gte_ctx {
     layer_weights *layers;
 
     /* Pooler (not used for embeddings but loaded) */
-    float *pooler_weight;     /* [hidden_size, hidden_size] */
-    float *pooler_bias;       /* [hidden_size] */
+    block_q4_0 *pooler_weight;     /* Quantized */
+    float *pooler_bias;            /* Float32 */
 
     /* Working memory for inference */
     float *hidden_states;     /* [max_seq_len, hidden_size] */
@@ -113,6 +123,16 @@ struct gte_ctx {
 /* ========================================================================
  * Utility Functions
  * ======================================================================== */
+
+/* Dependency-free string duplication */
+static char *my_strdup(const char *s) {
+    size_t len = strlen(s) + 1;
+    char *dup = malloc(len);
+    if (dup) {
+        strcpy(dup, s);
+    }
+    return dup;
+}
 
 /* FNV-1a hash for strings */
 static unsigned int hash_string(const char *str) {
@@ -133,7 +153,7 @@ static void vocab_hash_insert(vocab_entry *table, const char *word, int id) {
         }
         h = (h + 1) % VOCAB_HASH_SIZE;
     }
-    table[h].word = strdup(word);
+    table[h].word = my_strdup(word);
     table[h].id = id;
 }
 
@@ -182,6 +202,44 @@ static void linear(float *y, const float *x, const float *W, const float *b,
         }
     }
 #endif
+}
+
+/* Matrix-vector multiplication for Q4_0 weights: y = x @ W^T + b */
+static void linear_q4_0(float *y, const float *x, const block_q4_0 *W, const float *b,
+                        int seq_len, int in_dim, int out_dim) {
+    int num_blocks = in_dim / QK4_0;
+
+    for (int s = 0; s < seq_len; s++) {
+        const float *x_row = x + s * in_dim;
+        float *y_row = y + s * out_dim;
+
+        for (int o = 0; o < out_dim; o++) {
+            float sum = b ? b[o] : 0.0f;
+            const block_q4_0 *w_row = W + o * num_blocks;
+
+            /* Iterate over blocks */
+            for (int nb = 0; nb < num_blocks; nb++) {
+                const block_q4_0 *block = &w_row[nb];
+                float scale = block->scale;
+                const uint8_t *qs = block->qs;
+                const float *x_block = x_row + nb * QK4_0;
+
+                /* Dequantize and compute dot product for this block */
+                float block_sum = 0.0f;
+                for (int i = 0; i < 16; i++) {
+                    uint8_t q = qs[i];
+                    /* Lower nibble */
+                    int8_t v0 = (q & 0x0F) - 8;
+                    /* Upper nibble */
+                    int8_t v1 = (q >> 4) - 8;
+
+                    block_sum += (v0 * x_block[i*2]) + (v1 * x_block[i*2 + 1]);
+                }
+                sum += block_sum * scale;
+            }
+            y_row[o] = sum;
+        }
+    }
 }
 
 /* Layer normalization */
@@ -427,11 +485,11 @@ static void self_attention(gte_ctx *ctx, layer_weights *layer, int seq_len, cons
     int head_dim = ctx->head_dim;
 
     /* Project Q, K, V */
-    linear(ctx->q_proj, ctx->hidden_states, layer->query_weight, layer->query_bias,
+    linear_q4_0(ctx->q_proj, ctx->hidden_states, layer->query_weight, layer->query_bias,
            seq_len, hidden, hidden);
-    linear(ctx->k_proj, ctx->hidden_states, layer->key_weight, layer->key_bias,
+    linear_q4_0(ctx->k_proj, ctx->hidden_states, layer->key_weight, layer->key_bias,
            seq_len, hidden, hidden);
-    linear(ctx->v_proj, ctx->hidden_states, layer->value_weight, layer->value_bias,
+    linear_q4_0(ctx->v_proj, ctx->hidden_states, layer->value_weight, layer->value_bias,
            seq_len, hidden, hidden);
 
     /* Compute attention for each head */
@@ -510,7 +568,7 @@ static void self_attention(gte_ctx *ctx, layer_weights *layer, int seq_len, cons
 #endif
 
     /* Output projection */
-    linear(ctx->temp_hidden, ctx->attn_output, layer->attn_output_weight, layer->attn_output_bias,
+    linear_q4_0(ctx->temp_hidden, ctx->attn_output, layer->attn_output_weight, layer->attn_output_bias,
            seq_len, hidden, hidden);
 
     /* Residual connection and layer norm */
@@ -531,13 +589,13 @@ static void feed_forward(gte_ctx *ctx, layer_weights *layer, int seq_len) {
     int inter = ctx->intermediate_size;
 
     /* Intermediate layer */
-    linear(ctx->ffn_hidden, ctx->hidden_states, layer->ffn_inter_weight, layer->ffn_inter_bias,
+    linear_q4_0(ctx->ffn_hidden, ctx->hidden_states, layer->ffn_inter_weight, layer->ffn_inter_bias,
            seq_len, hidden, inter);
     gelu(ctx->ffn_hidden, seq_len * inter);
 
     /* Output layer */
-    linear(ctx->temp_hidden, ctx->ffn_hidden, layer->ffn_output_weight, layer->ffn_output_bias,
-           seq_len, inter, hidden);
+    linear_q4_0(ctx->temp_hidden, ctx->ffn_hidden, layer->ffn_output_weight, layer->ffn_output_bias,
+            seq_len, inter, hidden);
 
     /* Residual connection and layer norm */
 #ifdef USE_BLAS
@@ -631,6 +689,17 @@ static float *read_floats(FILE *f, int count) {
     return data;
 }
 
+static block_q4_0 *read_blocks(FILE *f, int num_weights) {
+    int num_blocks = num_weights / QK4_0;
+    block_q4_0 *data = malloc(num_blocks * sizeof(block_q4_0));
+    if (!data) return NULL;
+    if (fread(data, sizeof(block_q4_0), num_blocks, f) != (size_t)num_blocks) {
+        free(data);
+        return NULL;
+    }
+    return data;
+}
+
 gte_ctx *gte_load(const char *model_path) {
     FILE *f = fopen(model_path, "rb");
     if (!f) {
@@ -703,20 +772,20 @@ gte_ctx *gte_load(const char *model_path) {
     for (int l = 0; l < ctx->num_layers; l++) {
         layer_weights *layer = &ctx->layers[l];
 
-        layer->query_weight = read_floats(f, ctx->hidden_size * ctx->hidden_size);
+        layer->query_weight = read_blocks(f, ctx->hidden_size * ctx->hidden_size);
         layer->query_bias = read_floats(f, ctx->hidden_size);
-        layer->key_weight = read_floats(f, ctx->hidden_size * ctx->hidden_size);
+        layer->key_weight = read_blocks(f, ctx->hidden_size * ctx->hidden_size);
         layer->key_bias = read_floats(f, ctx->hidden_size);
-        layer->value_weight = read_floats(f, ctx->hidden_size * ctx->hidden_size);
+        layer->value_weight = read_blocks(f, ctx->hidden_size * ctx->hidden_size);
         layer->value_bias = read_floats(f, ctx->hidden_size);
-        layer->attn_output_weight = read_floats(f, ctx->hidden_size * ctx->hidden_size);
+        layer->attn_output_weight = read_blocks(f, ctx->hidden_size * ctx->hidden_size);
         layer->attn_output_bias = read_floats(f, ctx->hidden_size);
         layer->attn_ln_weight = read_floats(f, ctx->hidden_size);
         layer->attn_ln_bias = read_floats(f, ctx->hidden_size);
 
-        layer->ffn_inter_weight = read_floats(f, ctx->intermediate_size * ctx->hidden_size);
+        layer->ffn_inter_weight = read_blocks(f, ctx->intermediate_size * ctx->hidden_size);
         layer->ffn_inter_bias = read_floats(f, ctx->intermediate_size);
-        layer->ffn_output_weight = read_floats(f, ctx->hidden_size * ctx->intermediate_size);
+        layer->ffn_output_weight = read_blocks(f, ctx->hidden_size * ctx->intermediate_size);
         layer->ffn_output_bias = read_floats(f, ctx->hidden_size);
         layer->ffn_ln_weight = read_floats(f, ctx->hidden_size);
         layer->ffn_ln_bias = read_floats(f, ctx->hidden_size);
@@ -734,7 +803,7 @@ gte_ctx *gte_load(const char *model_path) {
     }
 
     /* Read pooler (not used for embeddings) */
-    ctx->pooler_weight = read_floats(f, ctx->hidden_size * ctx->hidden_size);
+    ctx->pooler_weight = read_blocks(f, ctx->hidden_size * ctx->hidden_size);
     ctx->pooler_bias = read_floats(f, ctx->hidden_size);
 
     fclose(f);

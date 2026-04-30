@@ -1,5 +1,6 @@
 # Model file (too large for git)
 *.gtemodel
+model_src/
 
 # Compiled binaries
 test_gte
