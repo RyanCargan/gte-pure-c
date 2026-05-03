@@ -95,10 +95,10 @@ struct gte_ctx {
     char **vocab;             /* Array of vocabulary words */
     vocab_entry *vocab_hash;  /* Hash table for word -> id lookup */
 
-    /* Embeddings */
-    float *token_embeddings;  /* [vocab_size, hidden_size] */
-    float *position_embeddings; /* [max_seq_len, hidden_size] */
-    float *token_type_embeddings; /* [2, hidden_size] */
+    /* Embeddings (quantized) */
+    block_q4_0 *token_embeddings;  /* [vocab_size, hidden_size] as quantized blocks */
+    block_q4_0 *position_embeddings; /* [max_seq_len, hidden_size] as quantized blocks */
+    block_q4_0 *token_type_embeddings; /* [2, hidden_size] as quantized blocks */
     float *embed_ln_weight;   /* [hidden_size] */
     float *embed_ln_bias;     /* [hidden_size] */
 
@@ -240,6 +240,28 @@ static void linear_q4_0(float *y, const float *x, const block_q4_0 *W, const flo
             y_row[o] = sum;
         }
     }
+}
+
+/* Helper to dequantize a single value from a row of quantized embeddings.
+ * `blocks` points to the start of the row (i.e., for a specific token/position).
+ * `idx` is the index within the row (0 <= idx < hidden_size).
+ * Returns the dequantized float value.
+ */
+static float dequantize_embedding_value(const block_q4_0 *blocks, int idx) {
+    int block_idx = idx / QK4_0;
+    const block_q4_0 *block = &blocks[block_idx];
+    float scale = block->scale;
+    int block_offset = idx % QK4_0;
+    int pair = block_offset / 2;
+    int which = block_offset % 2;
+    uint8_t q = block->qs[pair];
+    int8_t v;
+    if (which == 0) {
+        v = (q & 0x0F) - 8;
+    } else {
+        v = (q >> 4) - 8;
+    }
+    return v * scale;
 }
 
 /* Layer normalization */
@@ -614,13 +636,18 @@ static void transformer_forward(gte_ctx *ctx, const int *token_ids, int seq_len,
     int hidden = ctx->hidden_size;
 
     /* Compute embeddings */
+    int num_blocks_per_row = hidden / QK4_0;
+    const block_q4_0 *type_row = ctx->token_type_embeddings; /* segment 0 */
+
     for (int s = 0; s < seq_len; s++) {
         int token_id = token_ids[s];
+        const block_q4_0 *tok_row = ctx->token_embeddings + token_id * num_blocks_per_row;
+        const block_q4_0 *pos_row = ctx->position_embeddings + s * num_blocks_per_row;
         for (int d = 0; d < hidden; d++) {
-            ctx->hidden_states[s * hidden + d] =
-                ctx->token_embeddings[token_id * hidden + d] +
-                ctx->position_embeddings[s * hidden + d] +
-                ctx->token_type_embeddings[d]; /* token_type = 0 */
+            float tok_val = dequantize_embedding_value(tok_row, d);
+            float pos_val = dequantize_embedding_value(pos_row, d);
+            float type_val = dequantize_embedding_value(type_row, d);
+            ctx->hidden_states[s * hidden + d] = tok_val + pos_val + type_val;
         }
     }
 
@@ -752,10 +779,10 @@ gte_ctx *gte_load(const char *model_path) {
         vocab_hash_insert(ctx->vocab_hash, ctx->vocab[i], i);
     }
 
-    /* Read embeddings */
-    ctx->token_embeddings = read_floats(f, ctx->vocab_size * ctx->hidden_size);
-    ctx->position_embeddings = read_floats(f, ctx->max_seq_len * ctx->hidden_size);
-    ctx->token_type_embeddings = read_floats(f, 2 * ctx->hidden_size);
+    /* Read embeddings (quantized) */
+    ctx->token_embeddings = read_blocks(f, ctx->vocab_size * ctx->hidden_size);
+    ctx->position_embeddings = read_blocks(f, ctx->max_seq_len * ctx->hidden_size);
+    ctx->token_type_embeddings = read_blocks(f, 2 * ctx->hidden_size);
     ctx->embed_ln_weight = read_floats(f, ctx->hidden_size);
     ctx->embed_ln_bias = read_floats(f, ctx->hidden_size);
 

@@ -115,11 +115,11 @@ def main():
                 f.write(tensor.tobytes())
             return tensor.shape
 
-        # Embeddings (Kept as float32 for accuracy)
-        print("\nWriting embeddings (fp32)...")
-        write_tensor("embeddings.word_embeddings.weight")
-        write_tensor("embeddings.position_embeddings.weight")
-        write_tensor("embeddings.token_type_embeddings.weight")
+        # Embeddings (Quantized with Q4_0)
+        print("\nWriting embeddings (4-bit)...")
+        write_tensor_q4("embeddings.word_embeddings.weight")
+        write_tensor_q4("embeddings.position_embeddings.weight")
+        write_tensor_q4("embeddings.token_type_embeddings.weight")
         write_tensor("embeddings.LayerNorm.weight")
         write_tensor("embeddings.LayerNorm.bias")
 
