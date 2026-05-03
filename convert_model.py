@@ -35,13 +35,13 @@ def quantize_q4_0(tensor, block_size=32):
     inv_scales = np.where(scales != 0, 1.0 / scales, 0).reshape(-1, 1)
     quant = np.round(reshaped * inv_scales).clip(-8, 7).astype(np.int8)
 
-    # FIX: Shift values by +8 so they sit in the 0..15 range for the C code
+    # Shift values by +8 so they sit in the 0..15 range for the C code
     quant = (quant + 8).astype(np.uint8)
 
     packed = np.zeros((quant.shape[0], block_size // 2), dtype=np.uint8)
     for i in range(block_size // 2):
-        # FIX: Simply OR them together now
-        packed[:, i] = quant[:, i*2] | (quant[:, i*2+1] << 4)
+        # FIX: Pack sequentially instead of interleaved
+        packed[:, i] = quant[:, i] | (quant[:, i + block_size // 2] << 4)
 
     return scales, packed
 
