@@ -2,17 +2,6 @@
  * GTE-Small Embedding Library
  *
  * A pure C, dependency-free library for running GTE-small text embedding inference.
- *
- * Usage:
- *   gte_ctx *ctx = gte_load("gte-small.gtemodel");
- *   if (!ctx) { handle error }
- *
- *   float *embedding = gte_embed(ctx, "your text here");
- *   // embedding is a 384-dimensional vector
- *   // use it for similarity search, etc.
- *   free(embedding);
- *
- *   gte_free(ctx);
  */
 
 #ifndef GTE_H
@@ -53,8 +42,15 @@ float *gte_embed_batch(gte_ctx *ctx, const char **texts, int count);
 /* Get the embedding dimension (384 for GTE-small). */
 int gte_dim(gte_ctx *ctx);
 
-/* Get the maximum sequence length (512 for GTE-small). */
+/* Get the hard maximum sequence length supported by the model file (usually 512). */
 int gte_max_seq_len(gte_ctx *ctx);
+
+/*
+ * Set the current sequence length limit (default is 256).
+ * This truncates input text to save computation time.
+ * Cannot exceed the hard limit returned by gte_max_seq_len().
+ */
+void gte_set_seq_len(gte_ctx *ctx, int seq_len);
 
 /*
  * Compute cosine similarity between two embeddings.
