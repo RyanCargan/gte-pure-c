@@ -13,3 +13,6 @@ test_gte
 __pycache__/
 *.pyc
 *.npy
+
+# Tooling
+lore.txt
