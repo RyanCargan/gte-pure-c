@@ -2,7 +2,7 @@
  * GTE-Small Embedding Library Implementation
  *
  * Pure C implementation of BERT-based text embedding model.
- * No external dependencies.
+ * Optimized with SIMDe for portable ARM NEON intrinsics.
  */
 
 #include "gte.h"
@@ -13,13 +13,7 @@
 #include <ctype.h>
 #include <stdint.h>
 
-#ifdef USE_BLAS
-#ifdef __APPLE__
-#include <Accelerate/Accelerate.h>
-#else
-#include <cblas.h>
-#endif
-#endif
+#include "simde/arm/neon.h" // IWYU pragma: keep
 
 /* ========================================================================
  * Constants
@@ -124,7 +118,6 @@ struct gte_ctx {
  * Utility Functions
  * ======================================================================== */
 
-/* Dependency-free string duplication */
 static char *my_strdup(const char *s) {
     size_t len = strlen(s) + 1;
     char *dup = malloc(len);
@@ -134,7 +127,6 @@ static char *my_strdup(const char *s) {
     return dup;
 }
 
-/* FNV-1a hash for strings */
 static unsigned int hash_string(const char *str) {
     unsigned int hash = 2166136261u;
     while (*str) {
@@ -144,12 +136,11 @@ static unsigned int hash_string(const char *str) {
     return hash;
 }
 
-/* Add word to vocabulary hash table */
 static void vocab_hash_insert(vocab_entry *table, const char *word, int id) {
     unsigned int h = hash_string(word) % VOCAB_HASH_SIZE;
     while (table[h].word != NULL) {
         if (strcmp(table[h].word, word) == 0) {
-            return; /* Already exists */
+            return;
         }
         h = (h + 1) % VOCAB_HASH_SIZE;
     }
@@ -157,7 +148,6 @@ static void vocab_hash_insert(vocab_entry *table, const char *word, int id) {
     table[h].id = id;
 }
 
-/* Look up word in vocabulary, returns -1 if not found */
 static int vocab_lookup(vocab_entry *table, const char *word) {
     unsigned int h = hash_string(word) % VOCAB_HASH_SIZE;
     while (table[h].word != NULL) {
@@ -173,37 +163,6 @@ static int vocab_lookup(vocab_entry *table, const char *word) {
  * Matrix Operations
  * ======================================================================== */
 
-/* Matrix-vector multiplication with bias: y = x @ W^T + b
- * x: [seq_len, in_dim], W: [out_dim, in_dim], b: [out_dim], y: [seq_len, out_dim]
- * Note: Weight matrices in BERT are stored as [out_dim, in_dim]
- */
-static void linear(float *y, const float *x, const float *W, const float *b,
-                   int seq_len, int in_dim, int out_dim) {
-#ifdef USE_BLAS
-    /* y = x @ W^T using BLAS sgemm */
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                seq_len, out_dim, in_dim,
-                1.0f, x, in_dim, W, in_dim,
-                0.0f, y, out_dim);
-    /* Add bias: y[s,:] += b for each row using BLAS saxpy */
-    if (b) {
-        for (int s = 0; s < seq_len; s++) {
-            cblas_saxpy(out_dim, 1.0f, b, 1, y + s * out_dim, 1);
-        }
-    }
-#else
-    for (int s = 0; s < seq_len; s++) {
-        for (int o = 0; o < out_dim; o++) {
-            float sum = b ? b[o] : 0.0f;
-            for (int i = 0; i < in_dim; i++) {
-                sum += x[s * in_dim + i] * W[o * in_dim + i];
-            }
-            y[s * out_dim + o] = sum;
-        }
-    }
-#endif
-}
-
 /* Matrix-vector multiplication for Q4_0 weights: y = x @ W^T + b */
 static void linear_q4_0(float *y, const float *x, const block_q4_0 *W, const float *b,
                         int seq_len, int in_dim, int out_dim) {
@@ -217,36 +176,56 @@ static void linear_q4_0(float *y, const float *x, const block_q4_0 *W, const flo
             float sum = b ? b[o] : 0.0f;
             const block_q4_0 *w_row = W + o * num_blocks;
 
-            /* Iterate over blocks */
             for (int nb = 0; nb < num_blocks; nb++) {
                 const block_q4_0 *block = &w_row[nb];
                 float scale = block->scale;
                 const uint8_t *qs = block->qs;
                 const float *x_block = x_row + nb * QK4_0;
 
-                /* Dequantize and compute dot product for this block */
-                float block_sum = 0.0f;
-                for (int i = 0; i < 16; i++) {
-                    uint8_t q = qs[i];
-                    /* Lower nibble */
-                    int8_t v0 = (q & 0x0F) - 8;
-                    /* Upper nibble */
-                    int8_t v1 = (q >> 4) - 8;
+                simde_uint8x16_t q_vec = simde_vld1q_u8(qs);
+                simde_uint8x16_t mask = simde_vdupq_n_u8(0x0F);
 
-                    block_sum += (v0 * x_block[i*2]) + (v1 * x_block[i*2 + 1]);
-                }
-                sum += block_sum * scale;
+                simde_int8x16_t v0_s = simde_vsubq_s8(simde_vreinterpretq_s8_u8(simde_vandq_u8(q_vec, mask)), simde_vdupq_n_s8(8));
+                simde_int8x16_t v1_s = simde_vsubq_s8(simde_vreinterpretq_s8_u8(simde_vshrq_n_u8(q_vec, 4)), simde_vdupq_n_s8(8));
+
+                simde_int16x8_t v0_lo = simde_vmovl_s8(simde_vget_low_s8(v0_s));
+                simde_int16x8_t v0_hi = simde_vmovl_s8(simde_vget_high_s8(v0_s));
+                simde_int16x8_t v1_lo = simde_vmovl_s8(simde_vget_low_s8(v1_s));
+                simde_int16x8_t v1_hi = simde_vmovl_s8(simde_vget_high_s8(v1_s));
+
+                simde_float32x4_t f0_0 = simde_vcvtq_f32_s32(simde_vmovl_s16(simde_vget_low_s16(v0_lo)));
+                simde_float32x4_t f0_1 = simde_vcvtq_f32_s32(simde_vmovl_s16(simde_vget_high_s16(v0_lo)));
+                simde_float32x4_t f0_2 = simde_vcvtq_f32_s32(simde_vmovl_s16(simde_vget_low_s16(v0_hi)));
+                simde_float32x4_t f0_3 = simde_vcvtq_f32_s32(simde_vmovl_s16(simde_vget_high_s16(v0_hi)));
+
+                simde_float32x4_t f1_0 = simde_vcvtq_f32_s32(simde_vmovl_s16(simde_vget_low_s16(v1_lo)));
+                simde_float32x4_t f1_1 = simde_vcvtq_f32_s32(simde_vmovl_s16(simde_vget_high_s16(v1_lo)));
+                simde_float32x4_t f1_2 = simde_vcvtq_f32_s32(simde_vmovl_s16(simde_vget_low_s16(v1_hi)));
+                simde_float32x4_t f1_3 = simde_vcvtq_f32_s32(simde_vmovl_s16(simde_vget_high_s16(v1_hi)));
+
+                simde_float32x4x2_t x0 = simde_vld2q_f32(x_block + 0);
+                simde_float32x4x2_t x1 = simde_vld2q_f32(x_block + 8);
+                simde_float32x4x2_t x2 = simde_vld2q_f32(x_block + 16);
+                simde_float32x4x2_t x3 = simde_vld2q_f32(x_block + 24);
+
+                simde_float32x4_t acc = simde_vmulq_f32(f0_0, x0.val[0]);
+                acc = simde_vmlaq_f32(acc, f1_0, x0.val[1]);
+                acc = simde_vmlaq_f32(acc, f0_1, x1.val[0]);
+                acc = simde_vmlaq_f32(acc, f1_1, x1.val[1]);
+                acc = simde_vmlaq_f32(acc, f0_2, x2.val[0]);
+                acc = simde_vmlaq_f32(acc, f1_2, x2.val[1]);
+                acc = simde_vmlaq_f32(acc, f0_3, x3.val[0]);
+                acc = simde_vmlaq_f32(acc, f1_3, x3.val[1]);
+
+                float tmp[4];
+                simde_vst1q_f32(tmp, acc);
+                sum += (tmp[0] + tmp[1] + tmp[2] + tmp[3]) * scale;
             }
             y_row[o] = sum;
         }
     }
 }
 
-/* Helper to dequantize a single value from a row of quantized embeddings.
- * `blocks` points to the start of the row (i.e., for a specific token/position).
- * `idx` is the index within the row (0 <= idx < hidden_size).
- * Returns the dequantized float value.
- */
 static float dequantize_embedding_value(const block_q4_0 *blocks, int idx) {
     int block_idx = idx / QK4_0;
     const block_q4_0 *block = &blocks[block_idx];
@@ -255,30 +234,20 @@ static float dequantize_embedding_value(const block_q4_0 *blocks, int idx) {
     int pair = block_offset / 2;
     int which = block_offset % 2;
     uint8_t q = block->qs[pair];
-    int8_t v;
-    if (which == 0) {
-        v = (q & 0x0F) - 8;
-    } else {
-        v = (q >> 4) - 8;
-    }
+    int8_t v = (which == 0) ? (q & 0x0F) - 8 : (q >> 4) - 8;
     return v * scale;
 }
 
-/* Layer normalization */
 static void layer_norm(float *out, const float *x, const float *gamma, const float *beta,
                        int seq_len, int hidden_size) {
     for (int s = 0; s < seq_len; s++) {
         const float *x_row = x + s * hidden_size;
         float *out_row = out + s * hidden_size;
 
-        /* Compute mean */
         float mean = 0.0f;
-        for (int i = 0; i < hidden_size; i++) {
-            mean += x_row[i];
-        }
+        for (int i = 0; i < hidden_size; i++) mean += x_row[i];
         mean /= hidden_size;
 
-        /* Compute variance */
         float var = 0.0f;
         for (int i = 0; i < hidden_size; i++) {
             float diff = x_row[i] - mean;
@@ -286,7 +255,6 @@ static void layer_norm(float *out, const float *x, const float *gamma, const flo
         }
         var /= hidden_size;
 
-        /* Normalize and scale */
         float std_inv = 1.0f / sqrtf(var + GTE_LAYER_NORM_EPS);
         for (int i = 0; i < hidden_size; i++) {
             out_row[i] = gamma[i] * (x_row[i] - mean) * std_inv + beta[i];
@@ -294,49 +262,34 @@ static void layer_norm(float *out, const float *x, const float *gamma, const flo
     }
 }
 
-/* GELU activation (approximate) */
 static void gelu(float *x, int n) {
     for (int i = 0; i < n; i++) {
         float val = x[i];
-        /* GELU(x) = x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))) */
         x[i] = 0.5f * val * (1.0f + tanhf(0.7978845608f * (val + 0.044715f * val * val * val)));
     }
 }
 
-/* Softmax over last dimension */
 static void softmax(float *x, int n) {
-    /* Find max for numerical stability */
     float max_val = x[0];
-    for (int i = 1; i < n; i++) {
-        if (x[i] > max_val) max_val = x[i];
-    }
+    for (int i = 1; i < n; i++) if (x[i] > max_val) max_val = x[i];
 
-    /* Compute exp and sum */
     float sum = 0.0f;
     for (int i = 0; i < n; i++) {
         x[i] = expf(x[i] - max_val);
         sum += x[i];
     }
 
-    /* Normalize */
     float inv_sum = 1.0f / sum;
-    for (int i = 0; i < n; i++) {
-        x[i] *= inv_sum;
-    }
+    for (int i = 0; i < n; i++) x[i] *= inv_sum;
 }
 
-/* L2 normalize in place */
 static void l2_normalize(float *x, int n) {
     float norm = 0.0f;
-    for (int i = 0; i < n; i++) {
-        norm += x[i] * x[i];
-    }
+    for (int i = 0; i < n; i++) norm += x[i] * x[i];
     norm = sqrtf(norm);
     if (norm > 0.0f) {
         float inv_norm = 1.0f / norm;
-        for (int i = 0; i < n; i++) {
-            x[i] *= inv_norm;
-        }
+        for (int i = 0; i < n; i++) x[i] *= inv_norm;
     }
 }
 
@@ -344,154 +297,85 @@ static void l2_normalize(float *x, int n) {
  * Tokenizer
  * ======================================================================== */
 
-/* Check if character is punctuation (for basic tokenization) */
 static int is_punctuation(unsigned char c) {
-    return (c >= 33 && c <= 47) || (c >= 58 && c <= 64) ||
-           (c >= 91 && c <= 96) || (c >= 123 && c <= 126);
+    return (c >= 33 && c <= 47) || (c >= 58 && c <= 64) || (c >= 91 && c <= 96) || (c >= 123 && c <= 126);
 }
 
-/* Check if character is whitespace */
 static int is_whitespace(unsigned char c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r';
 }
 
-/* Basic tokenization: split on whitespace and punctuation, lowercase */
 static char **basic_tokenize(const char *text, int *num_tokens) {
     int capacity = 64;
     char **tokens = malloc(capacity * sizeof(char *));
     int count = 0;
-
     const char *p = text;
+
     while (*p) {
-        /* Skip whitespace */
         while (*p && is_whitespace(*p)) p++;
         if (!*p) break;
-
-        /* Find end of token */
         const char *start = p;
-        if (is_punctuation(*p)) {
-            /* Single punctuation is a token */
-            p++;
-        } else {
-            /* Read until whitespace or punctuation */
-            while (*p && !is_whitespace(*p) && !is_punctuation(*p)) {
-                p++;
-            }
-        }
+        if (is_punctuation(*p)) p++;
+        else while (*p && !is_whitespace(*p) && !is_punctuation(*p)) p++;
 
-        /* Create token (lowercase) */
         int len = p - start;
         char *token = malloc(len + 1);
-        for (int i = 0; i < len; i++) {
-            token[i] = tolower((unsigned char)start[i]);
-        }
+        for (int i = 0; i < len; i++) token[i] = tolower((unsigned char)start[i]);
         token[len] = '\0';
 
-        /* Add to list */
         if (count >= capacity) {
             capacity *= 2;
             tokens = realloc(tokens, capacity * sizeof(char *));
         }
         tokens[count++] = token;
     }
-
     *num_tokens = count;
     return tokens;
 }
 
-/* WordPiece tokenization of a single word */
 static int *wordpiece_tokenize(gte_ctx *ctx, const char *word, int *num_subtokens) {
     int len = strlen(word);
-    if (len == 0) {
-        *num_subtokens = 0;
-        return NULL;
-    }
-
-    /* Buffer for subtokens (max = len subtokens) */
+    if (len == 0) { *num_subtokens = 0; return NULL; }
     int *subtokens = malloc((len + 1) * sizeof(int));
     int count = 0;
-
     int start = 0;
     while (start < len) {
-        int end = len;
-        int found_id = -1;
-
-        /* Find longest matching subword */
+        int end = len, found_id = -1;
         while (start < end) {
-            /* Build candidate */
             char candidate[256];
             int cand_len = 0;
-
-            if (start > 0) {
-                candidate[cand_len++] = '#';
-                candidate[cand_len++] = '#';
-            }
-            for (int i = start; i < end && cand_len < 254; i++) {
-                candidate[cand_len++] = word[i];
-            }
+            if (start > 0) { candidate[cand_len++] = '#'; candidate[cand_len++] = '#'; }
+            for (int i = start; i < end && cand_len < 254; i++) candidate[cand_len++] = word[i];
             candidate[cand_len] = '\0';
-
             int id = vocab_lookup(ctx->vocab_hash, candidate);
-            if (id >= 0) {
-                found_id = id;
-                break;
-            }
+            if (id >= 0) { found_id = id; break; }
             end--;
         }
-
-        if (found_id < 0) {
-            /* No match found, use [UNK] for this character and move on */
-            subtokens[count++] = TOKEN_UNK;
-            start++;
-        } else {
-            subtokens[count++] = found_id;
-            start = end;
-        }
+        if (found_id < 0) { subtokens[count++] = TOKEN_UNK; start++; }
+        else { subtokens[count++] = found_id; start = end; }
     }
-
     *num_subtokens = count;
     return subtokens;
 }
 
-/* Full tokenization: text -> token IDs */
 static int *tokenize(gte_ctx *ctx, const char *text, int *num_tokens, int max_len) {
-    /* Basic tokenization */
     int num_basic;
     char **basic_tokens = basic_tokenize(text, &num_basic);
+    int capacity = 128, *all_tokens = malloc(capacity * sizeof(int)), total = 0;
 
-    /* Collect all subtoken IDs */
-    int capacity = 128;
-    int *all_tokens = malloc(capacity * sizeof(int));
-    int total = 0;
-
-    /* Add [CLS] */
     all_tokens[total++] = TOKEN_CLS;
-
-    /* WordPiece each token */
     for (int t = 0; t < num_basic && total < max_len - 1; t++) {
-        int num_sub;
-        int *subtokens = wordpiece_tokenize(ctx, basic_tokens[t], &num_sub);
-
+        int num_sub, *subtokens = wordpiece_tokenize(ctx, basic_tokens[t], &num_sub);
         for (int s = 0; s < num_sub && total < max_len - 1; s++) {
-            if (total >= capacity) {
-                capacity *= 2;
-                all_tokens = realloc(all_tokens, capacity * sizeof(int));
-            }
+            if (total >= capacity) { capacity *= 2; all_tokens = realloc(all_tokens, capacity * sizeof(int)); }
             all_tokens[total++] = subtokens[s];
         }
-
         free(subtokens);
         free(basic_tokens[t]);
     }
     free(basic_tokens);
-
-    /* Add [SEP] */
-    if (total >= capacity) {
-        capacity *= 2;
-        all_tokens = realloc(all_tokens, capacity * sizeof(int));
-    }
+    if (total >= capacity) all_tokens = realloc(all_tokens, (total + 1) * sizeof(int));
     all_tokens[total++] = TOKEN_SEP;
-
     *num_tokens = total;
     return all_tokens;
 }
@@ -500,191 +384,117 @@ static int *tokenize(gte_ctx *ctx, const char *text, int *num_tokens, int max_le
  * Transformer Forward Pass
  * ======================================================================== */
 
-/* Self-attention for a single layer */
 static void self_attention(gte_ctx *ctx, layer_weights *layer, int seq_len, const int *attn_mask) {
-    int hidden = ctx->hidden_size;
-    int heads = ctx->num_heads;
-    int head_dim = ctx->head_dim;
+    int hidden = ctx->hidden_size, heads = ctx->num_heads, head_dim = ctx->head_dim;
 
-    /* Project Q, K, V */
-    linear_q4_0(ctx->q_proj, ctx->hidden_states, layer->query_weight, layer->query_bias,
-           seq_len, hidden, hidden);
-    linear_q4_0(ctx->k_proj, ctx->hidden_states, layer->key_weight, layer->key_bias,
-           seq_len, hidden, hidden);
-    linear_q4_0(ctx->v_proj, ctx->hidden_states, layer->value_weight, layer->value_bias,
-           seq_len, hidden, hidden);
+    linear_q4_0(ctx->q_proj, ctx->hidden_states, layer->query_weight, layer->query_bias, seq_len, hidden, hidden);
+    linear_q4_0(ctx->k_proj, ctx->hidden_states, layer->key_weight, layer->key_bias, seq_len, hidden, hidden);
+    linear_q4_0(ctx->v_proj, ctx->hidden_states, layer->value_weight, layer->value_bias, seq_len, hidden, hidden);
 
-    /* Compute attention for each head */
     float scale = 1.0f / sqrtf((float)head_dim);
 
-#ifdef USE_BLAS
     for (int h = 0; h < heads; h++) {
-        float *scores = &ctx->attn_scores[h * seq_len * seq_len];
-        float *Q_h = &ctx->q_proj[h * head_dim];
-        float *K_h = &ctx->k_proj[h * head_dim];
-        float *V_h = &ctx->v_proj[h * head_dim];
-        float *out_h = &ctx->attn_output[h * head_dim];
-
-        /* Q @ K^T with scaling: scores[seq,seq] = scale * Q[seq,head_dim] @ K[seq,head_dim]^T */
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    seq_len, seq_len, head_dim,
-                    scale, Q_h, hidden, K_h, hidden,
-                    0.0f, scores, seq_len);
-
-        /* Apply attention mask and softmax */
-        for (int i = 0; i < seq_len; i++) {
-            if (attn_mask) {
-                for (int j = 0; j < seq_len; j++) {
-                    if (!attn_mask[j]) {
-                        scores[i * seq_len + j] = -10000.0f;
-                    }
-                }
-            }
-            softmax(&scores[i * seq_len], seq_len);
-        }
-
-        /* Attention @ V: out[seq,head_dim] = scores[seq,seq] @ V[seq,head_dim] */
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                    seq_len, head_dim, seq_len,
-                    1.0f, scores, seq_len, V_h, hidden,
-                    0.0f, out_h, hidden);
-    }
-#else
-    for (int h = 0; h < heads; h++) {
-        /* Attention scores for this head: Q @ K^T / sqrt(d_k) */
         for (int i = 0; i < seq_len; i++) {
             for (int j = 0; j < seq_len; j++) {
                 float score = 0.0f;
-                for (int d = 0; d < head_dim; d++) {
-                    int q_idx = i * hidden + h * head_dim + d;
-                    int k_idx = j * hidden + h * head_dim + d;
-                    score += ctx->q_proj[q_idx] * ctx->k_proj[k_idx];
+                int d = 0;
+                simde_float32x4_t acc = simde_vdupq_n_f32(0.0f);
+                for (; d <= head_dim - 4; d += 4) {
+                    simde_float32x4_t q_vec = simde_vld1q_f32(&ctx->q_proj[i * hidden + h * head_dim + d]);
+                    simde_float32x4_t k_vec = simde_vld1q_f32(&ctx->k_proj[j * hidden + h * head_dim + d]);
+                    acc = simde_vmlaq_f32(acc, q_vec, k_vec);
                 }
+                float tmp[4];
+                simde_vst1q_f32(tmp, acc);
+                score = tmp[0] + tmp[1] + tmp[2] + tmp[3];
+                for (; d < head_dim; d++) score += ctx->q_proj[i * hidden + h * head_dim + d] * ctx->k_proj[j * hidden + h * head_dim + d];
+
                 score *= scale;
-
-                /* Apply attention mask */
-                if (attn_mask && !attn_mask[j]) {
-                    score = -10000.0f;
-                }
-
+                if (attn_mask && !attn_mask[j]) score = -10000.0f;
                 ctx->attn_scores[h * seq_len * seq_len + i * seq_len + j] = score;
             }
-
-            /* Softmax over keys */
             softmax(&ctx->attn_scores[h * seq_len * seq_len + i * seq_len], seq_len);
         }
 
-        /* Weighted sum of values */
         for (int i = 0; i < seq_len; i++) {
-            for (int d = 0; d < head_dim; d++) {
-                float sum = 0.0f;
-                for (int j = 0; j < seq_len; j++) {
-                    float attn = ctx->attn_scores[h * seq_len * seq_len + i * seq_len + j];
-                    int v_idx = j * hidden + h * head_dim + d;
-                    sum += attn * ctx->v_proj[v_idx];
+            for (int d = 0; d < head_dim; d++) ctx->attn_output[i * hidden + h * head_dim + d] = 0.0f;
+            for (int j = 0; j < seq_len; j++) {
+                float attn = ctx->attn_scores[h * seq_len * seq_len + i * seq_len + j];
+                simde_float32x4_t attn_vec = simde_vdupq_n_f32(attn);
+                int d = 0;
+                for (; d <= head_dim - 4; d += 4) {
+                    int out_idx = i * hidden + h * head_dim + d, v_idx = j * hidden + h * head_dim + d;
+                    simde_float32x4_t out_vec = simde_vld1q_f32(&ctx->attn_output[out_idx]);
+                    simde_float32x4_t v_vec = simde_vld1q_f32(&ctx->v_proj[v_idx]);
+                    simde_vst1q_f32(&ctx->attn_output[out_idx], simde_vmlaq_f32(out_vec, attn_vec, v_vec));
                 }
-                ctx->attn_output[i * hidden + h * head_dim + d] = sum;
+                for (; d < head_dim; d++) ctx->attn_output[i * hidden + h * head_dim + d] += attn * ctx->v_proj[j * hidden + h * head_dim + d];
             }
         }
     }
-#endif
 
-    /* Output projection */
-    linear_q4_0(ctx->temp_hidden, ctx->attn_output, layer->attn_output_weight, layer->attn_output_bias,
-           seq_len, hidden, hidden);
+    linear_q4_0(ctx->temp_hidden, ctx->attn_output, layer->attn_output_weight, layer->attn_output_bias, seq_len, hidden, hidden);
 
-    /* Residual connection and layer norm */
-#ifdef USE_BLAS
-    cblas_saxpy(seq_len * hidden, 1.0f, ctx->hidden_states, 1, ctx->temp_hidden, 1);
-#else
-    for (int i = 0; i < seq_len * hidden; i++) {
-        ctx->temp_hidden[i] += ctx->hidden_states[i];
+    int total_elements = seq_len * hidden, i = 0;
+    for (; i <= total_elements - 4; i += 4) {
+        simde_float32x4_t t = simde_vld1q_f32(&ctx->temp_hidden[i]);
+        simde_float32x4_t h_vec = simde_vld1q_f32(&ctx->hidden_states[i]);
+        simde_vst1q_f32(&ctx->temp_hidden[i], simde_vaddq_f32(t, h_vec));
     }
-#endif
-    layer_norm(ctx->hidden_states, ctx->temp_hidden, layer->attn_ln_weight, layer->attn_ln_bias,
-               seq_len, hidden);
+    for (; i < total_elements; i++) ctx->temp_hidden[i] += ctx->hidden_states[i];
+
+    layer_norm(ctx->hidden_states, ctx->temp_hidden, layer->attn_ln_weight, layer->attn_ln_bias, seq_len, hidden);
 }
 
-/* Feed-forward network for a single layer */
 static void feed_forward(gte_ctx *ctx, layer_weights *layer, int seq_len) {
-    int hidden = ctx->hidden_size;
-    int inter = ctx->intermediate_size;
-
-    /* Intermediate layer */
-    linear_q4_0(ctx->ffn_hidden, ctx->hidden_states, layer->ffn_inter_weight, layer->ffn_inter_bias,
-           seq_len, hidden, inter);
+    int hidden = ctx->hidden_size, inter = ctx->intermediate_size;
+    linear_q4_0(ctx->ffn_hidden, ctx->hidden_states, layer->ffn_inter_weight, layer->ffn_inter_bias, seq_len, hidden, inter);
     gelu(ctx->ffn_hidden, seq_len * inter);
+    linear_q4_0(ctx->temp_hidden, ctx->ffn_hidden, layer->ffn_output_weight, layer->ffn_output_bias, seq_len, inter, hidden);
 
-    /* Output layer */
-    linear_q4_0(ctx->temp_hidden, ctx->ffn_hidden, layer->ffn_output_weight, layer->ffn_output_bias,
-            seq_len, inter, hidden);
-
-    /* Residual connection and layer norm */
-#ifdef USE_BLAS
-    cblas_saxpy(seq_len * hidden, 1.0f, ctx->hidden_states, 1, ctx->temp_hidden, 1);
-#else
-    for (int i = 0; i < seq_len * hidden; i++) {
-        ctx->temp_hidden[i] += ctx->hidden_states[i];
+    int total_elements = seq_len * hidden, i = 0;
+    for (; i <= total_elements - 4; i += 4) {
+        simde_float32x4_t t = simde_vld1q_f32(&ctx->temp_hidden[i]);
+        simde_float32x4_t h_vec = simde_vld1q_f32(&ctx->hidden_states[i]);
+        simde_vst1q_f32(&ctx->temp_hidden[i], simde_vaddq_f32(t, h_vec));
     }
-#endif
-    layer_norm(ctx->hidden_states, ctx->temp_hidden, layer->ffn_ln_weight, layer->ffn_ln_bias,
-               seq_len, hidden);
+    for (; i < total_elements; i++) ctx->temp_hidden[i] += ctx->hidden_states[i];
+    layer_norm(ctx->hidden_states, ctx->temp_hidden, layer->ffn_ln_weight, layer->ffn_ln_bias, seq_len, hidden);
 }
 
-/* Full transformer forward pass */
 static void transformer_forward(gte_ctx *ctx, const int *token_ids, int seq_len, const int *attn_mask) {
-    int hidden = ctx->hidden_size;
-
-    /* Compute embeddings */
-    int num_blocks_per_row = hidden / QK4_0;
-    const block_q4_0 *type_row = ctx->token_type_embeddings; /* segment 0 */
+    int hidden = ctx->hidden_size, num_blocks_per_row = hidden / QK4_0;
+    const block_q4_0 *type_row = ctx->token_type_embeddings;
 
     for (int s = 0; s < seq_len; s++) {
         int token_id = token_ids[s];
         const block_q4_0 *tok_row = ctx->token_embeddings + token_id * num_blocks_per_row;
         const block_q4_0 *pos_row = ctx->position_embeddings + s * num_blocks_per_row;
         for (int d = 0; d < hidden; d++) {
-            float tok_val = dequantize_embedding_value(tok_row, d);
-            float pos_val = dequantize_embedding_value(pos_row, d);
-            float type_val = dequantize_embedding_value(type_row, d);
-            ctx->hidden_states[s * hidden + d] = tok_val + pos_val + type_val;
+            ctx->hidden_states[s * hidden + d] = dequantize_embedding_value(tok_row, d) +
+                                                dequantize_embedding_value(pos_row, d) +
+                                                dequantize_embedding_value(type_row, d);
         }
     }
-
-    /* Embedding layer norm */
-    layer_norm(ctx->hidden_states, ctx->hidden_states, ctx->embed_ln_weight, ctx->embed_ln_bias,
-               seq_len, hidden);
-
-    /* Process each transformer layer */
+    layer_norm(ctx->hidden_states, ctx->hidden_states, ctx->embed_ln_weight, ctx->embed_ln_bias, seq_len, hidden);
     for (int l = 0; l < ctx->num_layers; l++) {
         self_attention(ctx, &ctx->layers[l], seq_len, attn_mask);
         feed_forward(ctx, &ctx->layers[l], seq_len);
     }
 }
 
-/* Mean pooling */
-static void mean_pooling(float *output, const float *hidden_states, const int *attn_mask,
-                         int seq_len, int hidden_size) {
-    /* Initialize output to zero */
+static void mean_pooling(float *output, const float *hidden_states, const int *attn_mask, int seq_len, int hidden_size) {
     memset(output, 0, hidden_size * sizeof(float));
-
-    /* Sum up hidden states for non-padded tokens */
     int count = 0;
     for (int s = 0; s < seq_len; s++) {
         if (attn_mask[s]) {
-            for (int d = 0; d < hidden_size; d++) {
-                output[d] += hidden_states[s * hidden_size + d];
-            }
+            for (int d = 0; d < hidden_size; d++) output[d] += hidden_states[s * hidden_size + d];
             count++;
         }
     }
-
-    /* Average */
     if (count > 0) {
         float inv_count = 1.0f / count;
-        for (int d = 0; d < hidden_size; d++) {
-            output[d] *= inv_count;
-        }
+        for (int d = 0; d < hidden_size; d++) output[d] *= inv_count;
     }
 }
 
@@ -709,10 +519,7 @@ static int read_uint16(FILE *f, int *val) {
 static float *read_floats(FILE *f, int count) {
     float *data = malloc(count * sizeof(float));
     if (!data) return NULL;
-    if (fread(data, sizeof(float), count, f) != (size_t)count) {
-        free(data);
-        return NULL;
-    }
+    if (fread(data, sizeof(float), count, f) != (size_t)count) { free(data); return NULL; }
     return data;
 }
 
@@ -720,85 +527,43 @@ static block_q4_0 *read_blocks(FILE *f, int num_weights) {
     int num_blocks = num_weights / QK4_0;
     block_q4_0 *data = malloc(num_blocks * sizeof(block_q4_0));
     if (!data) return NULL;
-    if (fread(data, sizeof(block_q4_0), num_blocks, f) != (size_t)num_blocks) {
-        free(data);
-        return NULL;
-    }
+    if (fread(data, sizeof(block_q4_0), num_blocks, f) != (size_t)num_blocks) { free(data); return NULL; }
     return data;
 }
 
 gte_ctx *gte_load(const char *model_path) {
     FILE *f = fopen(model_path, "rb");
-    if (!f) {
-        fprintf(stderr, "gte_load: cannot open %s\n", model_path);
-        return NULL;
-    }
-
-    /* Check magic */
+    if (!f) { fprintf(stderr, "gte_load: cannot open %s\n", model_path); return NULL; }
     char magic[4];
-    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, GTE_MAGIC, 4) != 0) {
-        fprintf(stderr, "gte_load: invalid magic\n");
-        fclose(f);
-        return NULL;
-    }
-
-    /* Allocate context */
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, GTE_MAGIC, 4) != 0) { fprintf(stderr, "gte_load: invalid magic\n"); fclose(f); return NULL; }
     gte_ctx *ctx = calloc(1, sizeof(gte_ctx));
-    if (!ctx) {
-        fclose(f);
-        return NULL;
-    }
+    if (!ctx) { fclose(f); return NULL; }
 
-    /* Read config */
-    if (!read_uint32(f, &ctx->vocab_size) ||
-        !read_uint32(f, &ctx->hidden_size) ||
-        !read_uint32(f, &ctx->num_layers) ||
-        !read_uint32(f, &ctx->num_heads) ||
-        !read_uint32(f, &ctx->intermediate_size) ||
-        !read_uint32(f, &ctx->max_seq_len)) {
-        fprintf(stderr, "gte_load: failed to read config\n");
-        goto error;
-    }
+    if (!read_uint32(f, &ctx->vocab_size) || !read_uint32(f, &ctx->hidden_size) || !read_uint32(f, &ctx->num_layers) ||
+        !read_uint32(f, &ctx->num_heads) || !read_uint32(f, &ctx->intermediate_size) || !read_uint32(f, &ctx->max_seq_len)) goto error;
 
     ctx->head_dim = ctx->hidden_size / ctx->num_heads;
-
-    /* Read vocabulary */
     ctx->vocab = malloc(ctx->vocab_size * sizeof(char *));
     ctx->vocab_hash = calloc(VOCAB_HASH_SIZE, sizeof(vocab_entry));
-    if (!ctx->vocab || !ctx->vocab_hash) goto error;
 
     for (int i = 0; i < ctx->vocab_size; i++) {
         int len;
         if (!read_uint16(f, &len)) goto error;
-
         ctx->vocab[i] = malloc(len + 1);
-        if (!ctx->vocab[i]) goto error;
         if (fread(ctx->vocab[i], 1, len, f) != (size_t)len) goto error;
         ctx->vocab[i][len] = '\0';
-
         vocab_hash_insert(ctx->vocab_hash, ctx->vocab[i], i);
     }
 
-    /* Read embeddings (quantized) */
     ctx->token_embeddings = read_blocks(f, ctx->vocab_size * ctx->hidden_size);
     ctx->position_embeddings = read_blocks(f, ctx->max_seq_len * ctx->hidden_size);
     ctx->token_type_embeddings = read_blocks(f, 2 * ctx->hidden_size);
     ctx->embed_ln_weight = read_floats(f, ctx->hidden_size);
     ctx->embed_ln_bias = read_floats(f, ctx->hidden_size);
-
-    if (!ctx->token_embeddings || !ctx->position_embeddings ||
-        !ctx->token_type_embeddings || !ctx->embed_ln_weight || !ctx->embed_ln_bias) {
-        goto error;
-    }
-
-    /* Read transformer layers */
-    ctx->layers = malloc(ctx->num_layers * sizeof(layer_weights));
-    if (!ctx->layers) goto error;
-    memset(ctx->layers, 0, ctx->num_layers * sizeof(layer_weights));
+    ctx->layers = calloc(ctx->num_layers, sizeof(layer_weights));
 
     for (int l = 0; l < ctx->num_layers; l++) {
         layer_weights *layer = &ctx->layers[l];
-
         layer->query_weight = read_blocks(f, ctx->hidden_size * ctx->hidden_size);
         layer->query_bias = read_floats(f, ctx->hidden_size);
         layer->key_weight = read_blocks(f, ctx->hidden_size * ctx->hidden_size);
@@ -809,125 +574,52 @@ gte_ctx *gte_load(const char *model_path) {
         layer->attn_output_bias = read_floats(f, ctx->hidden_size);
         layer->attn_ln_weight = read_floats(f, ctx->hidden_size);
         layer->attn_ln_bias = read_floats(f, ctx->hidden_size);
-
         layer->ffn_inter_weight = read_blocks(f, ctx->intermediate_size * ctx->hidden_size);
         layer->ffn_inter_bias = read_floats(f, ctx->intermediate_size);
         layer->ffn_output_weight = read_blocks(f, ctx->hidden_size * ctx->intermediate_size);
         layer->ffn_output_bias = read_floats(f, ctx->hidden_size);
         layer->ffn_ln_weight = read_floats(f, ctx->hidden_size);
         layer->ffn_ln_bias = read_floats(f, ctx->hidden_size);
-
-        if (!layer->query_weight || !layer->query_bias ||
-            !layer->key_weight || !layer->key_bias ||
-            !layer->value_weight || !layer->value_bias ||
-            !layer->attn_output_weight || !layer->attn_output_bias ||
-            !layer->attn_ln_weight || !layer->attn_ln_bias ||
-            !layer->ffn_inter_weight || !layer->ffn_inter_bias ||
-            !layer->ffn_output_weight || !layer->ffn_output_bias ||
-            !layer->ffn_ln_weight || !layer->ffn_ln_bias) {
-            goto error;
-        }
     }
 
-    /* Read pooler (not used for embeddings) */
     ctx->pooler_weight = read_blocks(f, ctx->hidden_size * ctx->hidden_size);
     ctx->pooler_bias = read_floats(f, ctx->hidden_size);
-
     fclose(f);
 
-    /* Allocate working memory */
-    int max_seq = ctx->max_seq_len;
-    int hidden = ctx->hidden_size;
-    int inter = ctx->intermediate_size;
-    int heads = ctx->num_heads;
-
-    ctx->hidden_states = malloc(max_seq * hidden * sizeof(float));
-    ctx->attn_scores = malloc(heads * max_seq * max_seq * sizeof(float));
-    ctx->q_proj = malloc(max_seq * hidden * sizeof(float));
-    ctx->k_proj = malloc(max_seq * hidden * sizeof(float));
-    ctx->v_proj = malloc(max_seq * hidden * sizeof(float));
-    ctx->attn_output = malloc(max_seq * hidden * sizeof(float));
-    ctx->ffn_hidden = malloc(max_seq * inter * sizeof(float));
-    ctx->temp_hidden = malloc(max_seq * hidden * sizeof(float));
-
-    if (!ctx->hidden_states || !ctx->attn_scores || !ctx->q_proj ||
-        !ctx->k_proj || !ctx->v_proj || !ctx->attn_output ||
-        !ctx->ffn_hidden || !ctx->temp_hidden) {
-        gte_free(ctx);
-        return NULL;
-    }
-
+    ctx->hidden_states = malloc(ctx->max_seq_len * ctx->hidden_size * sizeof(float));
+    ctx->attn_scores = malloc(ctx->num_heads * ctx->max_seq_len * ctx->max_seq_len * sizeof(float));
+    ctx->q_proj = malloc(ctx->max_seq_len * ctx->hidden_size * sizeof(float));
+    ctx->k_proj = malloc(ctx->max_seq_len * ctx->hidden_size * sizeof(float));
+    ctx->v_proj = malloc(ctx->max_seq_len * ctx->hidden_size * sizeof(float));
+    ctx->attn_output = malloc(ctx->max_seq_len * ctx->hidden_size * sizeof(float));
+    ctx->ffn_hidden = malloc(ctx->max_seq_len * ctx->intermediate_size * sizeof(float));
+    ctx->temp_hidden = malloc(ctx->max_seq_len * ctx->hidden_size * sizeof(float));
     return ctx;
 
 error:
     fprintf(stderr, "gte_load: error reading model\n");
-    fclose(f);
-    gte_free(ctx);
-    return NULL;
+    fclose(f); gte_free(ctx); return NULL;
 }
 
 void gte_free(gte_ctx *ctx) {
     if (!ctx) return;
-
-    /* Free vocabulary */
-    if (ctx->vocab) {
-        for (int i = 0; i < ctx->vocab_size; i++) {
-            free(ctx->vocab[i]);
-        }
-        free(ctx->vocab);
-    }
-    if (ctx->vocab_hash) {
-        for (int i = 0; i < VOCAB_HASH_SIZE; i++) {
-            free(ctx->vocab_hash[i].word);
-        }
-        free(ctx->vocab_hash);
-    }
-
-    /* Free embeddings */
-    free(ctx->token_embeddings);
-    free(ctx->position_embeddings);
-    free(ctx->token_type_embeddings);
-    free(ctx->embed_ln_weight);
-    free(ctx->embed_ln_bias);
-
-    /* Free layers */
+    if (ctx->vocab) { for (int i = 0; i < ctx->vocab_size; i++) free(ctx->vocab[i]); free(ctx->vocab); }
+    if (ctx->vocab_hash) { for (int i = 0; i < VOCAB_HASH_SIZE; i++) free(ctx->vocab_hash[i].word); free(ctx->vocab_hash); }
+    free(ctx->token_embeddings); free(ctx->position_embeddings); free(ctx->token_type_embeddings);
+    free(ctx->embed_ln_weight); free(ctx->embed_ln_bias);
     if (ctx->layers) {
         for (int l = 0; l < ctx->num_layers; l++) {
             layer_weights *layer = &ctx->layers[l];
-            free(layer->query_weight);
-            free(layer->query_bias);
-            free(layer->key_weight);
-            free(layer->key_bias);
-            free(layer->value_weight);
-            free(layer->value_bias);
-            free(layer->attn_output_weight);
-            free(layer->attn_output_bias);
-            free(layer->attn_ln_weight);
-            free(layer->attn_ln_bias);
-            free(layer->ffn_inter_weight);
-            free(layer->ffn_inter_bias);
-            free(layer->ffn_output_weight);
-            free(layer->ffn_output_bias);
-            free(layer->ffn_ln_weight);
-            free(layer->ffn_ln_bias);
+            free(layer->query_weight); free(layer->query_bias); free(layer->key_weight); free(layer->key_bias);
+            free(layer->value_weight); free(layer->value_bias); free(layer->attn_output_weight); free(layer->attn_output_bias);
+            free(layer->attn_ln_weight); free(layer->attn_ln_bias); free(layer->ffn_inter_weight); free(layer->ffn_inter_bias);
+            free(layer->ffn_output_weight); free(layer->ffn_output_bias); free(layer->ffn_ln_weight); free(layer->ffn_ln_bias);
         }
         free(ctx->layers);
     }
-
-    /* Free pooler */
-    free(ctx->pooler_weight);
-    free(ctx->pooler_bias);
-
-    /* Free working memory */
-    free(ctx->hidden_states);
-    free(ctx->attn_scores);
-    free(ctx->q_proj);
-    free(ctx->k_proj);
-    free(ctx->v_proj);
-    free(ctx->attn_output);
-    free(ctx->ffn_hidden);
-    free(ctx->temp_hidden);
-
+    free(ctx->pooler_weight); free(ctx->pooler_bias);
+    free(ctx->hidden_states); free(ctx->attn_scores); free(ctx->q_proj); free(ctx->k_proj);
+    free(ctx->v_proj); free(ctx->attn_output); free(ctx->ffn_hidden); free(ctx->temp_hidden);
     free(ctx);
 }
 
@@ -937,71 +629,38 @@ void gte_free(gte_ctx *ctx) {
 
 float *gte_embed(gte_ctx *ctx, const char *text) {
     if (!ctx || !text) return NULL;
-
-    /* Tokenize */
-    int num_tokens;
-    int *token_ids = tokenize(ctx, text, &num_tokens, ctx->max_seq_len);
+    int num_tokens, *token_ids = tokenize(ctx, text, &num_tokens, ctx->max_seq_len);
     if (!token_ids) return NULL;
 
-    /* Create attention mask */
     int *attn_mask = malloc(num_tokens * sizeof(int));
-    for (int i = 0; i < num_tokens; i++) {
-        attn_mask[i] = 1;
-    }
+    for (int i = 0; i < num_tokens; i++) attn_mask[i] = 1;
 
-    /* Run transformer */
     transformer_forward(ctx, token_ids, num_tokens, attn_mask);
 
-    /* Mean pooling */
     float *embedding = malloc(ctx->hidden_size * sizeof(float));
-    if (!embedding) {
-        free(token_ids);
-        free(attn_mask);
-        return NULL;
-    }
     mean_pooling(embedding, ctx->hidden_states, attn_mask, num_tokens, ctx->hidden_size);
-
-    /* L2 normalize */
     l2_normalize(embedding, ctx->hidden_size);
 
-    free(token_ids);
-    free(attn_mask);
-
+    free(token_ids); free(attn_mask);
     return embedding;
 }
 
 float *gte_embed_batch(gte_ctx *ctx, const char **texts, int count) {
     if (!ctx || !texts || count <= 0) return NULL;
-
     float *embeddings = malloc(count * ctx->hidden_size * sizeof(float));
-    if (!embeddings) return NULL;
-
     for (int i = 0; i < count; i++) {
         float *emb = gte_embed(ctx, texts[i]);
-        if (!emb) {
-            free(embeddings);
-            return NULL;
-        }
+        if (!emb) { free(embeddings); return NULL; }
         memcpy(embeddings + i * ctx->hidden_size, emb, ctx->hidden_size * sizeof(float));
         free(emb);
     }
-
     return embeddings;
 }
 
-int gte_dim(gte_ctx *ctx) {
-    return ctx ? ctx->hidden_size : 0;
-}
-
-int gte_max_seq_len(gte_ctx *ctx) {
-    return ctx ? ctx->max_seq_len : 0;
-}
-
+int gte_dim(gte_ctx *ctx) { return ctx ? ctx->hidden_size : 0; }
+int gte_max_seq_len(gte_ctx *ctx) { return ctx ? ctx->max_seq_len : 0; }
 float gte_cosine_similarity(const float *a, const float *b, int dim) {
-    /* Assumes normalized vectors, so dot product = cosine similarity */
     float dot = 0.0f;
-    for (int i = 0; i < dim; i++) {
-        dot += a[i] * b[i];
-    }
+    for (int i = 0; i < dim; i++) dot += a[i] * b[i];
     return dot;
 }

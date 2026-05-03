@@ -16,3 +16,6 @@ __pycache__/
 
 # Tooling
 lore.txt
+simde/
+dump/
+vendor/

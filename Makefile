@@ -1,29 +1,13 @@
 CC = gcc
-CFLAGS = -O3 -march=native -ffast-math -Wall -Wextra
+CFLAGS = -O3 -march=native -ffast-math -Wall -Wextra -Isimde
 LDFLAGS = -lm
 
-# Detect OS for BLAS linking
-UNAME_S := $(shell uname -s)
-ifeq ($(UNAME_S),Darwin)
-	BLAS_CFLAGS = -DACCELERATE_NEW_LAPACK
-	BLAS_LDFLAGS = -framework Accelerate
-else
-	BLAS_CFLAGS = -I/usr/include -I/usr/local/include
-	BLAS_LDFLAGS = -lblas
-endif
-
 all:
-	@echo "Usage: make generic   (pure C, no dependencies)"
-	@echo "       make blas      (BLAS-accelerated, faster)"
+   	@echo "Usage: make generic   (pure C + SIMDe)"
 
 # Generic (pure C) build
 generic: CFLAGS += -DUSE_GENERIC
 generic: test_gte
-
-# BLAS-accelerated build
-blas: CFLAGS += -DUSE_BLAS $(BLAS_CFLAGS)
-blas: LDFLAGS += $(BLAS_LDFLAGS)
-blas: test_gte
 
 test_gte: test_gte.c gte.c gte.h
 	$(CC) $(CFLAGS) -o $@ test_gte.c gte.c $(LDFLAGS)
